@@ -22,9 +22,28 @@ _PAY_KEYWORDS = {"pay", "payment", "checkout", "billing", "invoice", "transfer",
                  "wallet", "paypal", "stripe", "venmo"}
 _CRYPTO_KEYWORDS = {"crypto", "bitcoin", "btc", "ethereum", "eth", "blockchain",
                     "nft", "defi", "token", "wallet", "binance", "coinbase"}
+
+# TLDs considerados de alta legitimidad (prob cercana a 1.0)
+_HIGH_LEGIT_TLDS = {"com", "org", "net", "edu", "gov", "mil", "int",
+                    "co.uk", "co.jp", "co.au", "ac.uk", "gov.uk"}
+# TLDs frecuentemente asociados a phishing (prob baja)
+_SUSPICIOUS_TLDS = {"tk", "ml", "ga", "cf", "gq", "pw", "top", "xyz",
+                    "icu", "site", "online", "click", "link", "work"}
+
 _OBFUSCATED_PATTERN = re.compile(r'%[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|&#\d+;|&[a-z]+;')
-_SPECIAL_CHARS = set('!@#$%^&*()-_=+[]{}|;:\'",.<>?/\\`~')
-_REQUEST_TIMEOUT = 8
+# Caracteres especiales relevantes para phishing (excluyendo ://. que son normales en URLs)
+_SPECIAL_CHARS = set('!@#$^*[]{}|;\'",<>`~')
+_REQUEST_TIMEOUT = 6
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+}
 
 
 def _load_feature_keys() -> list[str]:
@@ -40,7 +59,6 @@ def _parse_url(url: str) -> dict:
         parsed = urllib.parse.urlparse("")
 
     netloc = parsed.netloc or ""
-    # Strip port from host
     host = netloc.split(":")[0] if ":" in netloc else netloc
 
     if _USE_TLDEXTRACT:
@@ -48,17 +66,20 @@ def _parse_url(url: str) -> dict:
         domain = ext.domain + ("." + ext.suffix if ext.suffix else "")
         tld = ext.suffix or ""
         subdomains = ext.subdomain or ""
+        registered_domain = ext.registered_domain or host
     else:
         parts = host.split(".")
         tld = parts[-1] if len(parts) >= 2 else ""
         domain = ".".join(parts[-2:]) if len(parts) >= 2 else host
         subdomains = ".".join(parts[:-2]) if len(parts) > 2 else ""
+        registered_domain = domain
 
     return {
         "url": url,
         "parsed": parsed,
         "host": host,
         "domain": domain,
+        "registered_domain": registered_domain,
         "tld": tld,
         "subdomains": subdomains,
         "path": parsed.path or "",
@@ -73,7 +94,6 @@ def _is_ip(host: str) -> bool:
         return True
     except socket.error:
         pass
-    # IPv6
     try:
         socket.inet_pton(socket.AF_INET6, host.strip("[]"))
         return True
@@ -81,12 +101,8 @@ def _is_ip(host: str) -> bool:
         return False
 
 
-def _count_special(text: str) -> int:
-    return sum(1 for c in text if c in _SPECIAL_CHARS)
-
-
 def _char_continuation_rate(url: str) -> float:
-    """Ratio of consecutive same-character pairs to total pairs."""
+    """Ratio de pares de caracteres consecutivos iguales respecto al total de pares."""
     if len(url) < 2:
         return 0.0
     pairs = len(url) - 1
@@ -94,23 +110,43 @@ def _char_continuation_rate(url: str) -> float:
     return consecutive / pairs
 
 
+def _tld_legitimate_prob(tld: str) -> float:
+    """Heurística de probabilidad de legitimidad según el TLD."""
+    tld_lower = tld.lower()
+    if tld_lower in _HIGH_LEGIT_TLDS:
+        return 0.9
+    if tld_lower in _SUSPICIOUS_TLDS:
+        return 0.1
+    # TLDs de país genéricos → probabilidad media
+    if len(tld_lower) == 2:
+        return 0.6
+    return 0.4
+
+
+def _url_char_prob(url: str) -> float:
+    """
+    Probabilidad heurística basada en composición de caracteres de la URL.
+    URLs legítimas tienen alto ratio de letras y bajo ratio de caracteres raros.
+    """
+    if not url:
+        return 0.0
+    letters = sum(1 for c in url if c.isalpha())
+    digits = sum(1 for c in url if c.isdigit())
+    normal = letters + digits + url.count('.') + url.count('/') + url.count(':') + url.count('-') + url.count('_')
+    return min(normal / len(url), 1.0)
+
+
 def _fetch_html(url: str) -> tuple[str | None, int]:
-    """Returns (html_text, redirect_count). html is None on failure."""
-    headers_falsos = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8"
-}
+    """Retorna (html_text, redirect_count). html es None si falla."""
     try:
         session = requests.Session()
         resp = session.get(
             url,
-            timeout=3,
-            headers=headers_falsos,
+            timeout=_REQUEST_TIMEOUT,
+            headers=_HEADERS,
             allow_redirects=True,
         )
-        redirects = len(resp.history)
-        return resp.text, redirects
+        return resp.text, len(resp.history)
     except Exception:
         return None, 0
 
@@ -119,14 +155,13 @@ def _check_robots(url: str) -> float:
     try:
         parsed = urllib.parse.urlparse(url)
         robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-        resp = requests.get(robots_url, timeout=_REQUEST_TIMEOUT,
-                            headers={"User-Agent": "Mozilla/5.0"})
+        resp = requests.get(robots_url, timeout=_REQUEST_TIMEOUT, headers=_HEADERS)
         return 1.0 if resp.status_code == 200 and len(resp.text) > 0 else 0.0
     except Exception:
         return 0.0
 
 
-def _extract_html_features(html: str, url: str, parsed_url: dict) -> dict:
+def _extract_html_features(html: str | None, url: str, parsed_url: dict) -> dict:
     defaults = {
         "LineOfCode": 0.0, "LargestLineLength": 0.0, "HasTitle": 0.0,
         "DomainTitleMatchScore": 0.0, "URLTitleMatchScore": 0.0,
@@ -156,10 +191,9 @@ def _extract_html_features(html: str, url: str, parsed_url: dict) -> dict:
 
     domain_lower = parsed_url["domain"].lower().replace("www.", "")
     if title_text and domain_lower:
-        domain_in_title = 1.0 if domain_lower in title_text else 0.0
-        defaults["DomainTitleMatchScore"] = domain_in_title
+        defaults["DomainTitleMatchScore"] = 1.0 if domain_lower in title_text else 0.0
         url_words = set(re.split(r'[\W_]+', parsed_url["url"].lower()))
-        title_words = set(re.split(r'[\W_]+', title_text))
+        title_words = set(re.split(r'[\W_]+', title_text)) - {""}
         overlap = len(url_words & title_words)
         defaults["URLTitleMatchScore"] = min(float(overlap) / max(len(title_words), 1), 1.0)
 
@@ -175,7 +209,7 @@ def _extract_html_features(html: str, url: str, parsed_url: dict) -> dict:
     desc = soup.find("meta", attrs={"name": re.compile("description", re.I)})
     defaults["HasDescription"] = 1.0 if desc else 0.0
 
-    # Popups (window.open in scripts)
+    # Popups (window.open en scripts)
     scripts = soup.find_all("script")
     popup_count = 0
     for s in scripts:
@@ -186,8 +220,8 @@ def _extract_html_features(html: str, url: str, parsed_url: dict) -> dict:
     # iFrames
     defaults["NoOfiFrame"] = float(len(soup.find_all("iframe")))
 
-    # Forms
-    base_domain = parsed_url["domain"]
+    # Forms con acción externa
+    base_domain = parsed_url["registered_domain"]
     forms = soup.find_all("form")
     external_form = 0
     for form in forms:
@@ -197,15 +231,17 @@ def _extract_html_features(html: str, url: str, parsed_url: dict) -> dict:
             break
     defaults["HasExternalFormSubmit"] = float(external_form)
 
-    # Social networks in links
+    # Redes sociales en enlaces
     all_links = [a.get("href", "") for a in soup.find_all("a", href=True)]
-    has_social = any(
-        any(sn in link for sn in _SOCIAL_NETS) for link in all_links
-    )
+    has_social = any(any(sn in link for sn in _SOCIAL_NETS) for link in all_links)
     defaults["HasSocialNet"] = 1.0 if has_social else 0.0
 
     # Submit button
-    submit = soup.find("input", {"type": "submit"}) or soup.find("button", {"type": "submit"})
+    submit = (
+        soup.find("input", {"type": "submit"})
+        or soup.find("button", {"type": "submit"})
+        or soup.find("button", {"type": lambda t: t is None})
+    )
     defaults["HasSubmitButton"] = 1.0 if submit else 0.0
 
     # Hidden fields
@@ -220,7 +256,7 @@ def _extract_html_features(html: str, url: str, parsed_url: dict) -> dict:
     body_text = soup.get_text(separator=" ", strip=True).lower()
     defaults["HasCopyrightInfo"] = 1.0 if ("©" in body_text or "copyright" in body_text) else 0.0
 
-    # Images, CSS, JS
+    # Recursos
     defaults["NoOfImage"] = float(len(soup.find_all("img")))
     defaults["NoOfCSS"] = float(
         len(soup.find_all("link", rel=lambda r: r and "stylesheet" in " ".join(r).lower()))
@@ -231,7 +267,7 @@ def _extract_html_features(html: str, url: str, parsed_url: dict) -> dict:
     # Self / empty / external refs
     self_ref = empty_ref = external_ref = 0
     for link in all_links:
-        if not link or link == "#":
+        if not link or link in ("#", "javascript:void(0)", "javascript:;"):
             empty_ref += 1
         elif link.startswith("http") and base_domain not in link:
             external_ref += 1
@@ -241,19 +277,28 @@ def _extract_html_features(html: str, url: str, parsed_url: dict) -> dict:
     defaults["NoOfEmptyRef"] = float(empty_ref)
     defaults["NoOfExternalRef"] = float(external_ref)
 
+    # Self-redirects vía JS
+    self_redirect = 0
+    if html:
+        self_redirect = len(re.findall(
+            rf'location\.(?:href|replace|assign)\s*=\s*["\'](?:/|{re.escape(base_domain)})',
+            html, re.IGNORECASE
+        ))
+    defaults["NoOfSelfRedirect"] = float(self_redirect)
+
     return defaults
 
 
 def extract_features(url: str) -> dict[str, float]:
-    """Extract 49 phishing-detection features from a URL."""
+    """Extrae exactamente 49 características de phishing a partir de una URL."""
     feature_keys = _load_feature_keys()
     result: dict[str, float] = {k: 0.0 for k in feature_keys}
 
     p = _parse_url(url)
-    full_url = url
 
-    # --- Lexical / URL features ---
-    result["URLLength"] = float(len(full_url))
+    # ── Características léxicas de la URL ────────────────────────────────────
+
+    result["URLLength"] = float(len(url))
     result["DomainLength"] = float(len(p["domain"]))
     result["IsDomainIP"] = 1.0 if _is_ip(p["host"]) else 0.0
     result["TLDLength"] = float(len(p["tld"]))
@@ -261,66 +306,55 @@ def extract_features(url: str) -> dict[str, float]:
     subdomain_parts = [s for s in p["subdomains"].split(".") if s]
     result["NoOfSubDomain"] = float(len(subdomain_parts))
 
-    result["CharContinuationRate"] = _char_continuation_rate(full_url)
+    result["CharContinuationRate"] = _char_continuation_rate(url)
 
-    # Obfuscation (percent-encoding and HTML entities in URL)
-    obfuscated_matches = _OBFUSCATED_PATTERN.findall(full_url)
-    result["HasObfuscation"] = 1.0 if obfuscated_matches else 0.0
-    result["NoOfObfuscatedChar"] = float(len(obfuscated_matches))
-    result["ObfuscationRatio"] = (
-        len(obfuscated_matches) / len(full_url) if full_url else 0.0
-    )
+    # Ofuscación (percent-encoding, entidades HTML en URL)
+    obfuscated = _OBFUSCATED_PATTERN.findall(url)
+    result["HasObfuscation"] = 1.0 if obfuscated else 0.0
+    result["NoOfObfuscatedChar"] = float(len(obfuscated))
+    result["ObfuscationRatio"] = len(obfuscated) / len(url) if url else 0.0
 
-    letters = [c for c in full_url if c.isalpha()]
-    digits = [c for c in full_url if c.isdigit()]
-    special = [c for c in full_url if c in _SPECIAL_CHARS]
+    # Composición de caracteres
+    letters = [c for c in url if c.isalpha()]
+    digits  = [c for c in url if c.isdigit()]
+    special = [c for c in url if c in _SPECIAL_CHARS]
 
-    result["NoOfLettersInURL"] = float(len(letters))
-    result["LetterRatioInURL"] = len(letters) / len(full_url) if full_url else 0.0
-    result["NoOfDegitsInURL"] = float(len(digits))
-    result["DegitRatioInURL"] = len(digits) / len(full_url) if full_url else 0.0
-    result["NoOfEqualsInURL"] = float(full_url.count("="))
-    result["NoOfQMarkInURL"] = float(full_url.count("?"))
-    result["NoOfAmpersandInURL"] = float(full_url.count("&"))
-    result["NoOfOtherSpecialCharsInURL"] = float(
-        len(special) - full_url.count("=") - full_url.count("?") - full_url.count("&")
-    )
-    result["SpacialCharRatioInURL"] = len(special) / len(full_url) if full_url else 0.0
-    result["IsHTTPS"] = 1.0 if p["scheme"].lower() == "https" else 0.0
+    result["NoOfLettersInURL"]         = float(len(letters))
+    result["LetterRatioInURL"]         = len(letters) / len(url) if url else 0.0
+    result["NoOfDegitsInURL"]          = float(len(digits))
+    result["DegitRatioInURL"]          = len(digits) / len(url) if url else 0.0
+    result["NoOfEqualsInURL"]          = float(url.count("="))
+    result["NoOfQMarkInURL"]           = float(url.count("?"))
+    result["NoOfAmpersandInURL"]       = float(url.count("&"))
+    # Caracteres especiales que NO son =, ?, & (ya contados arriba)
+    result["NoOfOtherSpecialCharsInURL"] = float(max(0, len(special)))
+    result["SpacialCharRatioInURL"]    = len(special) / len(url) if url else 0.0
+    result["IsHTTPS"]                  = 1.0 if p["scheme"].lower() == "https" else 0.0
 
-    # Keyword features (check full URL)
-    url_lower = full_url.lower()
-    result["Bank"] = 1.0 if any(k in url_lower for k in _BANK_KEYWORDS) else 0.0
-    result["Pay"] = 1.0 if any(k in url_lower for k in _PAY_KEYWORDS) else 0.0
+    # Palabras clave en la URL
+    url_lower = url.lower()
+    result["Bank"]   = 1.0 if any(k in url_lower for k in _BANK_KEYWORDS)   else 0.0
+    result["Pay"]    = 1.0 if any(k in url_lower for k in _PAY_KEYWORDS)    else 0.0
     result["Crypto"] = 1.0 if any(k in url_lower for k in _CRYPTO_KEYWORDS) else 0.0
 
-    # Probabilistic / external-DB features — default 0.0 (no external DB)
-    result["TLDLegitimateProb"] = 0.0
-    result["URLCharProb"] = 0.0
+    # Probabilidades heurísticas basadas en estructura léxica
+    result["TLDLegitimateProb"] = _tld_legitimate_prob(p["tld"])
+    result["URLCharProb"]       = _url_char_prob(url)
 
-    # --- Fetch HTML ---
-    html, redirect_count = _fetch_html(full_url)
+    # ── Fetch del HTML ───────────────────────────────────────────────────────
+
+    html, redirect_count = _fetch_html(url)
     result["NoOfURLRedirect"] = float(redirect_count)
+    result["Robots"]          = _check_robots(url)
 
-    # robots.txt (parallel-ish but kept simple)
-    result["Robots"] = _check_robots(full_url)
+    # ── Características estructurales del HTML ───────────────────────────────
 
-    # --- HTML features ---
-    html_feats = _extract_html_features(html, full_url, p)
+    html_feats = _extract_html_features(html, url, p)
     for k, v in html_feats.items():
         if k in result:
             result[k] = float(v)
 
-    # Self-redirects: JS location.href pointing to same domain
-    self_redirect = 0
-    if html:
-        self_redirect = len(re.findall(
-            rf'location\.(?:href|replace|assign)\s*=\s*["\'](?:/|{re.escape(p["domain"])})',
-            html, re.IGNORECASE
-        ))
-    result["NoOfSelfRedirect"] = float(self_redirect)
-
-    # Guarantee all 49 keys exist and are float
+    # Garantiza que todas las 49 claves sean float
     for k in feature_keys:
         result[k] = float(result.get(k, 0.0))
 
@@ -330,7 +364,7 @@ def extract_features(url: str) -> dict[str, float]:
 if __name__ == "__main__":
     import sys
     target = sys.argv[1] if len(sys.argv) > 1 else "https://www.google.com"
-    print(f"Extrayendo características de: {target}")
+    print(f"Extrayendo características de: {target}\n")
     feats = extract_features(target)
     print(json.dumps(feats, indent=2))
     print(f"\nTotal de características: {len(feats)}")
