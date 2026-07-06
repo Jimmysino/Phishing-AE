@@ -1,10 +1,10 @@
-# Sistema Predictivo de Detección de Phishing 🛡️
+# Sistema Predictivo de Detección de Phishing 
 
 ## Descripción del Proyecto
 Este sistema implementa un motor de Inteligencia Artificial basado en Aprendizaje Estadístico para detectar sitios web de phishing en tiempo real. Utiliza algoritmos de clasificación (Random Forest, Decision Tree, Logistic Regression) para analizar características léxicas y estructurales de URLs.
 
 ## Dataset
-El modelo fue entrenado utilizando el **PhiUSIIL Phishing URL Dataset**, garantizando una robusta generalización frente a amenazas modernas.
+El modelo fue entrenado utilizando el **PhiUSIIL Phishing URL Dataset.csv**, garantizando una robusta generalización frente a amenazas modernas.
 
 ## Rendimiento del Modelo (Random Forest Optimizado)
 - **Accuracy:** 99.99%
