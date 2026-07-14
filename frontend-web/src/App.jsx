@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import './App.css'
 
-const API_URL = 'http://localhost:3000/api/analyze'
+const API_URL = '[https://api-phishing-ia.onrender.com/predict](https://api-phishing-ia.onrender.com/predict)'
 
 export default function App() {
   const [url, setUrl] = useState('')
